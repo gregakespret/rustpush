@@ -572,6 +572,10 @@ struct CommunicationId {
     ids: CommunicationIdIds
 }
 
+// `Default` exists for consumers that assemble a `BeaconAccessory` purely to read its
+// `master_record` / `naming` (the key-export path) and have no ratchet state to supply. Such a
+// ratchet has an empty secret and cannot derive location keys — `get_current` rejects it rather
+// than ratcheting nothing into more nothing.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct BeaconRatchet {
     index: usize,
@@ -719,6 +723,11 @@ impl BeaconAccessory {
     }
 
     fn get_current(&mut self) -> Result<Vec<(usize, EcKey<Private>)>, PushError> {
+        // An empty secret ratchets to another empty secret, so without this the accessory would
+        // quietly produce keys that decrypt nothing rather than reporting that it has no state.
+        if self.primary_ratchet.secret.is_empty() || self.secondary_ratchet.secret.is_empty() {
+            return Err(PushError::BeaconRatchetUninitialized);
+        }
         let mut primary = self.get_current_primary();
         primary.extend(self.get_current_secondary());
         primary.into_iter().map(|i| Ok((i.index, self.derive_ps_key(&i.secret)?))).collect()

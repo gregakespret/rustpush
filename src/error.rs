@@ -152,6 +152,10 @@ pub enum PushError {
     ReportSpamError(u32),
     #[error("Token missing")]
     TokenMissing,
+    #[error("MobileMe delegate config has no {0}")]
+    MobileMeConfigMissing(&'static str),
+    #[error("Beacon ratchet has no secret; this accessory carries no ratchet state and cannot derive location keys")]
+    BeaconRatchetUninitialized,
     #[error("APS not ready! {0}")]
     APSNotReady(&'static str),
     #[error("Circle http error {0}")]

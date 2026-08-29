@@ -114,17 +114,26 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         })
     }
 
-    pub async fn set_mme_delegate(&self, delegate: MobileMeDelegateResponse) {
+    // `refreshed` is when this delegate was actually obtained. Pass `SystemTime::now()` for one
+    // that was just logged in for; a delegate restored from disk must pass its original time, or
+    // the week-long freshness window below silently re-arms and hands out expired tokens.
+    pub async fn set_mme_delegate(&self, delegate: MobileMeDelegateResponse, refreshed: SystemTime) {
         *self.mme_delegate.lock().await = Some(delegate);
-        *self.mme_refreshed.lock().await = SystemTime::now();
+        *self.mme_refreshed.lock().await = refreshed;
     }
 
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
         let token = self.get_mme_token("mmeAuthToken").await?;
 
-        let quota_url = self.mme_delegate.lock().await.as_ref().expect("no MMe?")
-            .config.get("com.apple.Dataclass.Quota").expect("No Quota?").as_dictionary().unwrap()
-            .get("storageInfoURL").expect("no storage info url?").as_string().unwrap().to_string();
+        // `config` is `#[serde(default)]` because the iosbuddy endpoint omits it, so every lookup
+        // under it is genuinely optional and cannot be an `expect`.
+        let quota_url = self.mme_delegate.lock().await.as_ref()
+            .and_then(|delegate| delegate.config.get("com.apple.Dataclass.Quota"))
+            .and_then(|quota| quota.as_dictionary())
+            .and_then(|quota| quota.get("storageInfoURL"))
+            .and_then(|url| url.as_string())
+            .ok_or(PushError::MobileMeConfigMissing("com.apple.Dataclass.Quota storageInfoURL"))?
+            .to_string();
         
         let account = self.account.lock().await;
         let dsid = account.spd.as_ref().unwrap().get("DsPrsId").expect("no dsid???s").as_unsigned_integer().unwrap().to_string();
@@ -176,7 +185,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
         // refresh every week
-        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
+        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap_or(Duration::MAX)
             > Duration::from_secs(60 * 60 * 24 * 7) {
             self.refresh_mme().await?;
         }
