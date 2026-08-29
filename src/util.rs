@@ -512,6 +512,12 @@ pub fn base64_decode(data: &str) -> Vec<u8> {
     general_purpose::STANDARD.decode(data).unwrap()
 }
 
+// For blobs that arrive from a server and may be malformed, where a panic would take down more
+// than the one record being parsed.
+pub fn base64_decode_checked(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    general_purpose::STANDARD.decode(data)
+}
+
 pub fn base64_encode_url(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(data)
 }

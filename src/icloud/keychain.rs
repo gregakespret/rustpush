@@ -31,7 +31,7 @@ use crate::{TokenProvider, cloudkit::{CreateSubscriptionOperation, DeleteRecordO
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
-use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FunctionInvokeOperation, ALL_ASSETS}, util::{CompactECKey, base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, decode_uleb128, duration_since_epoch, ec_deserialize_priv, ec_serialize_priv, encode_hex, kdf_ctr_hmac, plist_to_bin, plist_to_string, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt, rfc6637_unwrap_key, NSData, NSDataClass, REQWEST}, APSConnection, APSMessage, IdentityManager, KeyedArchive, OSConfig, PushError};
+use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FunctionInvokeOperation, ALL_ASSETS}, util::{CompactECKey, base64_decode, base64_decode_checked, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, decode_uleb128, duration_since_epoch, ec_deserialize_priv, ec_serialize_priv, encode_hex, kdf_ctr_hmac, plist_to_bin, plist_to_string, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt, rfc6637_unwrap_key, NSData, NSDataClass, REQWEST}, APSConnection, APSMessage, IdentityManager, KeyedArchive, OSConfig, PushError};
 
 use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
 use backon::Retryable;
@@ -1053,11 +1053,14 @@ impl KeychainClientState {
         })
     }
 
-    pub fn new_with_host(dsid: String, adsid: String, host: String) -> KeychainClientState {
+    // `escrow_proxy_url` is a full URL (as `new` above takes it from `escrowProxyUrl`), not a bare
+    // host: it is used as a prefix in `format!("{}/escrowproxy/api/...")`, so a schemeless value
+    // fails far from here with reqwest's `RelativeUrlWithoutBase`.
+    pub fn new_with_host(dsid: String, adsid: String, escrow_proxy_url: String) -> KeychainClientState {
         KeychainClientState {
             dsid,
             adsid,
-            host,
+            host: escrow_proxy_url,
             state_token: None,
             state: HashMap::new(),
             user_identity: None,
@@ -1730,12 +1733,21 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 continue;
             };
 
-            let decoded = base64_decode(&meta.metadata);
+            let decoded = match base64_decode_checked(&meta.metadata) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    warn!("Discarding escrow metadata that is not valid base64: {error}");
+                    invalid_metadata += 1;
+                    continue;
+                }
+            };
             match plist::from_bytes::<Value>(&decoded) {
                 Ok(value) => match plist::from_value(&value) {
                     Ok(metadata) => bottles.push((data, metadata)),
                     Err(error) => {
-                        debug!(
+                        // Same severity as the sibling arms below: both discard a bottle, and this
+                        // shape dump is the only thing that says *why* at default log levels.
+                        warn!(
                             "Escrow metadata schema mismatch: {error}; top-level shape: [{}]",
                             metadata_shape(&value)
                         );
