@@ -362,7 +362,17 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         password: pet.to_string()
     };
 
-    let validation_data = os_config.generate_validation_data().await.ok();
+    // Losing validation data is not fatal, but the resulting login omits X-Mme-Nas-Qualify and
+    // Apple answers UNAUTHORIZED — indistinguishable downstream from bad credentials, which sends
+    // callers into a needless re-login/2FA. Log it so the real cause is visible.
+    let validation_data = match os_config.generate_validation_data().await {
+        Ok(data) => Some(data),
+        Err(error) => {
+            warn!("Failed to generate validation data, continuing without X-Mme-Nas-Qualify; \
+                   Apple may reject this login as UNAUTHORIZED: {error}");
+            None
+        }
+    };
 
     let base_headers = account.anisette.lock().await.get_headers().await?.clone();
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
