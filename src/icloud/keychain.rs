@@ -1038,12 +1038,26 @@ pub struct KeychainClientState {
     pub items: HashMap<String, SavedKeychainZone>,
 }
 
+// `MobileMeDelegateResponse::config` is `#[serde(default)]`, so an absent dataclass is ordinary
+// rather than exceptional — but a bare `None` at the call site is indistinguishable from an account
+// that genuinely has no such service, so say which key was missing.
+pub(crate) fn mme_config_url(delegate: &MobileMeDelegateResponse, dataclass: &str, key: &str) -> Option<String> {
+    let url = delegate.config.get(dataclass)
+        .and_then(|config| config.as_dictionary())
+        .and_then(|config| config.get(key))
+        .and_then(|url| url.as_string());
+    if url.is_none() {
+        warn!("MobileMe delegate config has no {dataclass} {key}; that service is unavailable for this account");
+    }
+    url.map(str::to_string)
+}
+
 impl KeychainClientState {
     pub fn new(dsid: String, adsid: String, delegate: &MobileMeDelegateResponse) -> Option<KeychainClientState> {
         Some(KeychainClientState {
             dsid,
             adsid,
-            host: delegate.config.get("com.apple.Dataclass.KeychainSync")?.as_dictionary().unwrap().get("escrowProxyUrl")?.as_string().unwrap().to_string(),
+            host: mme_config_url(delegate, "com.apple.Dataclass.KeychainSync", "escrowProxyUrl")?,
             state_token: None,
             state: HashMap::new(),
             user_identity: None,
