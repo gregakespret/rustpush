@@ -53,3 +53,10 @@ jobs:
         with:
           command: build
           args: --release --features '${{ matrix.features }}' --package rustpush --lib
+
+      # Same profile as the build above so the artifacts are reused rather than
+      # recompiled from scratch in debug.
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --release --features '${{ matrix.features }}' --package rustpush --lib
