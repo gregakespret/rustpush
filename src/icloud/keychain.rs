@@ -1138,6 +1138,89 @@ pub struct EscrowMetadata {
     pub multiple_icsc: bool,
 }
 
+/// Why one escrow record's metadata blob did not become an [`EscrowMetadata`].
+///
+/// One type rather than three inline `continue`s, so the message and the discard
+/// counter cannot drift apart and the decode is reachable from a test without a
+/// live [`KeychainClient`].
+#[derive(Debug)]
+enum EscrowMetadataError {
+    NotBase64(base64::DecodeError),
+    NotPlist(plist::Error),
+    /// Carries the top-level key/type listing as well as serde's error: serde names
+    /// the field it *wanted*, and only the shape says what Apple actually sent.
+    SchemaMismatch { error: plist::Error, shape: String },
+}
+
+/// These strings are a cross-repo interface, not just operator prose. export-findmy
+/// raises this module to `info` behind a redaction guard and then prints only the
+/// records it recognises by prefix (`SAFE_PREFIXES` in its `src/logging.rs`), so a
+/// reworded variant goes silently missing from the logs there rather than merely
+/// reading differently. `the_messages_keep_the_prefixes_export_findmy_filters_on`
+/// below pins them.
+impl std::fmt::Display for EscrowMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBase64(error) => {
+                write!(f, "Discarding escrow metadata that is not valid base64: {error}")
+            }
+            Self::NotPlist(error) => {
+                write!(f, "Discarding escrow metadata that is not a valid plist: {error}")
+            }
+            Self::SchemaMismatch { error, shape } => {
+                write!(f, "Escrow metadata schema mismatch: {error}; top-level shape: [{shape}]")
+            }
+        }
+    }
+}
+
+/// The top-level keys of a metadata plist paired with their value *types*.
+///
+/// Names and types only, never a value: this string goes to a log that may be
+/// pasted into a bug report, and the dictionary it describes belongs to the user's
+/// escrow record.
+fn metadata_shape(value: &Value) -> String {
+    fn value_type(value: &Value) -> &'static str {
+        match value {
+            Value::Array(_) => "array",
+            Value::Dictionary(_) => "dictionary",
+            Value::Boolean(_) => "boolean",
+            Value::Data(_) => "data",
+            Value::Date(_) => "date",
+            Value::Real(_) => "real",
+            Value::Integer(_) => "integer",
+            Value::String(_) => "string",
+            Value::Uid(_) => "uid",
+            _ => "unknown",
+        }
+    }
+
+    match value {
+        Value::Dictionary(dict) => dict
+            .iter()
+            .map(|(key, value)| format!("{key}:{}", value_type(value)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => value_type(other).to_string(),
+    }
+}
+
+/// Decode one escrow record's base64 `metadata` blob.
+///
+/// Every failure here is per-record and recoverable: Apple returns one blob per
+/// bottle, and one malformed blob must not cost the user the bottles that would
+/// have worked. That is also why the base64 step is [`base64_decode_checked`] —
+/// plain `base64_decode` unwraps, and a single unexpected blob took the whole
+/// export down with it.
+fn decode_escrow_metadata(blob: &str) -> Result<EscrowMetadata, EscrowMetadataError> {
+    let decoded = base64_decode_checked(blob).map_err(EscrowMetadataError::NotBase64)?;
+    let value: Value = plist::from_bytes(&decoded).map_err(EscrowMetadataError::NotPlist)?;
+    plist::from_value(&value).map_err(|error| EscrowMetadataError::SchemaMismatch {
+        error,
+        shape: metadata_shape(&value),
+    })
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 struct EscrowBottle {
@@ -1662,32 +1745,6 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn get_viable_bottles(&self) -> Result<Vec<(EscrowData, EscrowMetadata)>, PushError> {
-        fn metadata_shape(value: &Value) -> String {
-            fn value_type(value: &Value) -> &'static str {
-                match value {
-                    Value::Array(_) => "array",
-                    Value::Dictionary(_) => "dictionary",
-                    Value::Boolean(_) => "boolean",
-                    Value::Data(_) => "data",
-                    Value::Date(_) => "date",
-                    Value::Real(_) => "real",
-                    Value::Integer(_) => "integer",
-                    Value::String(_) => "string",
-                    Value::Uid(_) => "uid",
-                    _ => "unknown",
-                }
-            }
-
-            match value {
-                Value::Dictionary(dict) => dict
-                    .iter()
-                    .map(|(key, value)| format!("{key}:{}", value_type(value)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                other => value_type(other).to_string(),
-            }
-        }
-
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct EscrowMetadataOuter {
@@ -1733,29 +1790,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 continue;
             };
 
-            let decoded = match base64_decode_checked(&meta.metadata) {
-                Ok(decoded) => decoded,
+            match decode_escrow_metadata(&meta.metadata) {
+                Ok(metadata) => bottles.push((data, metadata)),
                 Err(error) => {
-                    warn!("Discarding escrow metadata that is not valid base64: {error}");
-                    invalid_metadata += 1;
-                    continue;
-                }
-            };
-            match plist::from_bytes::<Value>(&decoded) {
-                Ok(value) => match plist::from_value(&value) {
-                    Ok(metadata) => bottles.push((data, metadata)),
-                    Err(error) => {
-                        // Same severity as the sibling arms below: both discard a bottle, and this
-                        // shape dump is the only thing that says *why* at default log levels.
-                        warn!(
-                            "Escrow metadata schema mismatch: {error}; top-level shape: [{}]",
-                            metadata_shape(&value)
-                        );
-                        invalid_metadata += 1;
-                    }
-                },
-                Err(error) => {
-                    warn!("Discarding escrow metadata that is not a valid plist: {error}");
+                    // Same severity as the summary below: all of these discard a bottle, and the
+                    // message is the only thing that says *why* at default log levels.
+                    warn!("{error}");
                     invalid_metadata += 1;
                 }
             }
@@ -2437,5 +2477,146 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let dec = decrypt(Cipher::aes_128_cbc(), &derived_key, Some(&payloads[1][..16]), &payloads[3])?;
 
         Ok(dec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A metadata blob shaped exactly as `get_viable_bottles` receives it: an XML
+    /// plist, base64 in the standard alphabet.
+    fn blob(dict: Dictionary) -> String {
+        base64_encode(plist_to_string(&Value::Dictionary(dict)).unwrap().as_bytes())
+    }
+
+    /// Every key `EscrowMetadata` asks for, with the types Apple sends.
+    fn well_formed() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("serial".into(), Value::String("C02ABCDEFGH".into()));
+        dict.insert("build".into(), Value::String("23H222".into()));
+        dict.insert("passcodeGeneration".into(), Value::Integer(1.into()));
+        dict.insert(
+            "com.apple.securebackup.timestamp".into(),
+            Value::String("2026-08-29 05:00:00".into()),
+        );
+        dict.insert("bottleID".into(), Value::String("A1B2C3D4-0000".into()));
+        dict.insert("ClientMetadata".into(), Value::Dictionary(Dictionary::new()));
+        dict.insert("escrowedSPKI".into(), Value::Data(vec![1, 2, 3]));
+        dict.insert("SecureBackupUsesMultipleiCSCs".into(), Value::Boolean(true));
+        dict
+    }
+
+    #[test]
+    fn a_well_formed_record_decodes() {
+        let metadata =
+            decode_escrow_metadata(&blob(well_formed())).expect("well-formed metadata decodes");
+        assert_eq!(metadata.serial, "C02ABCDEFGH");
+        assert_eq!(metadata.bottle_id, "A1B2C3D4-0000");
+        assert_eq!(metadata.passcode_generation, 1);
+    }
+
+    #[test]
+    fn an_absent_passcode_generation_is_defaulted_not_rejected() {
+        // Apple omits the key entirely on some accounts. Rejecting those records
+        // discarded the user's only viable bottle and surfaced as "no bottles
+        // found" — a different problem with a different, useless answer. The
+        // `#[serde(default)]` on the field is what makes this pass; drop it and
+        // the account becomes unrecoverable again.
+        let mut dict = well_formed();
+        dict.remove("passcodeGeneration");
+        let metadata = decode_escrow_metadata(&blob(dict))
+            .expect("a missing passcodeGeneration must not discard the bottle");
+        assert_eq!(metadata.passcode_generation, 0);
+    }
+
+    #[test]
+    fn a_blob_that_is_not_standard_base64_is_reported_not_fatal() {
+        // This decode used to `unwrap()`. One record in the URL-safe alphabet, or
+        // with stray whitespace or short padding, then aborted the entire export —
+        // taking down every other bottle that would have decoded fine.
+        for bad in ["a-b_cd==", "YWJj\nZA==", "YWJjZA="] {
+            assert!(
+                matches!(
+                    decode_escrow_metadata(bad),
+                    Err(EscrowMetadataError::NotBase64(_))
+                ),
+                "{bad:?} should be reported as a bad blob, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_that_is_not_a_plist_is_distinguished_from_a_bad_blob() {
+        // The two failures have different fixes — a transport/encoding problem
+        // versus Apple handing us something that is not a record at all — so the
+        // log has to tell them apart. A truncated binary plist is the realistic
+        // shape of this: the `bplist00` magic commits the reader to that format,
+        // and there is no trailer behind it.
+        let blob = base64_encode(b"bplist00");
+        assert!(matches!(
+            decode_escrow_metadata(&blob),
+            Err(EscrowMetadataError::NotPlist(_))
+        ));
+    }
+
+    #[test]
+    fn plain_text_is_a_schema_mismatch_rather_than_a_plist_error() {
+        // Not a curiosity — it is why `NotPlist` almost never fires. `plist` also
+        // reads the ASCII/NeXTSTEP format, so arbitrary text parses as a bare
+        // `Value::String` and only fails when serde tries to make a struct of it.
+        // Anyone reading these logs should expect a garbled blob to surface as a
+        // schema mismatch whose shape is `[string]`, not as "not a valid plist".
+        let Err(EscrowMetadataError::SchemaMismatch { shape, .. }) =
+            decode_escrow_metadata(&base64_encode(b"not a plist at all"))
+        else {
+            panic!("plain text parses as an ASCII plist string");
+        };
+        assert_eq!(shape, "string");
+    }
+
+    #[test]
+    fn a_wrong_field_type_reports_the_shape_that_actually_arrived() {
+        // serde names the field it wanted and the type it wanted; only the shape
+        // says what Apple sent instead, which is what turns "some bottles were
+        // discarded" into a one-line struct change.
+        let mut dict = well_formed();
+        dict.insert("passcodeGeneration".into(), Value::String("7".into()));
+        let Err(EscrowMetadataError::SchemaMismatch { shape, .. }) =
+            decode_escrow_metadata(&blob(dict))
+        else {
+            panic!("a string where a u32 belongs is a schema mismatch");
+        };
+        assert!(shape.contains("passcodeGeneration:string"), "{shape}");
+        assert!(shape.contains("escrowedSPKI:data"), "{shape}");
+        // Key names and value types only. The shape is printed at `warn` and ends
+        // up in pasted bug reports, so no value from the record may ride along.
+        assert!(!shape.contains("C02ABCDEFGH"), "{shape}");
+        assert!(!shape.contains("A1B2C3D4"), "{shape}");
+    }
+
+    #[test]
+    fn the_messages_keep_the_prefixes_export_findmy_filters_on() {
+        // export-findmy prints this module's sub-`warn` records only when it
+        // recognises them by prefix (`SAFE_PREFIXES` in its `src/logging.rs`).
+        // Reword a message there and the diagnostic does not change wording in the
+        // export logs — it disappears from them.
+        let mut mismatched = well_formed();
+        mismatched.insert("passcodeGeneration".into(), Value::String("7".into()));
+        let cases = [
+            (blob(mismatched), "Escrow metadata schema mismatch: "),
+            (
+                base64_encode(b"bplist00"),
+                "Discarding escrow metadata that is not a valid plist: ",
+            ),
+            (
+                "a-b_cd==".to_string(),
+                "Discarding escrow metadata that is not valid base64: ",
+            ),
+        ];
+        for (blob, prefix) in cases {
+            let message = decode_escrow_metadata(&blob).unwrap_err().to_string();
+            assert!(message.starts_with(prefix), "{message:?} vs {prefix:?}");
+        }
     }
 }
