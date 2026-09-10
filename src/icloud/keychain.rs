@@ -316,12 +316,14 @@ fn tlkshare_extra_signing_bytes(value: &cloudkit_proto::record::field::Value) ->
         let unix = date.time? + 978307200.0;
         return Some(DateTime::from_timestamp(unix.floor() as i64, 0)?.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
     }
-    // NSNumber goes in as unsignedLongLongValue: two's complement for integers, truncated for doubles
+    // NSNumber goes in as unsignedLongLongValue: two's complement for integers, negative doubles
+    // saturate to UINT64_MAX, and non-negative doubles truncate towards zero.
     if let Some(i) = value.signed_value {
         return Some(i.to_le_bytes().to_vec());
     }
     if let Some(d) = value.double_value {
-        return Some((d as u64).to_le_bytes().to_vec());
+        let unsigned = if d < 0.0 { u64::MAX } else { d as u64 };
+        return Some(unsigned.to_le_bytes().to_vec());
     }
     None
 }
@@ -2613,6 +2615,11 @@ mod tlkshare_signing_tests {
         assert_eq!(signing_payload(&share_record(vec![field("n", int(7))])), apple_payload_with(&7u64.to_le_bytes()));
         assert_eq!(signing_payload(&share_record(vec![field("n", int(-1))])), apple_payload_with(&[0xff; 8]));
         assert_eq!(signing_payload(&share_record(vec![field("n", double(2.9))])), apple_payload_with(&2u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn a_negative_double_extra_uses_nsnumber_unsigned_saturation() {
+        assert_eq!(signing_payload(&share_record(vec![field("n", double(-2.9))])), apple_payload_with(&[0xff; 8]));
     }
 
     #[test]
