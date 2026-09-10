@@ -271,8 +271,14 @@ pub struct CuttlefishTlkShare {
 }
 
 impl CuttlefishTlkShare {
-    fn data_for_signing(&self) -> Vec<u8> {
-        [
+    /// The record keys -[CKKSTLKShare dataForSigning:] knows about; every other key is signed as an extra.
+    const KNOWN_KEYS: &'static [&'static str] = &["sender", "receiver", "receiverPublicEncryptionKey", "curve", "epoch", "poisoned", "signature", "version", "parentkeyref", "wrappedkey"];
+
+    // `fields` is the record this share was decoded from. Apple signs every field it doesn't know
+    // (bar server_*) after the positional ones, sorted by key, so a newer device can add fields
+    // without breaking older verifiers. Leaving them out fails every share that carries one.
+    fn data_for_signing(&self, fields: &[Field]) -> Vec<u8> {
+        let mut data = [
             &self.version.to_le_bytes()[..],
             self.receiver.as_bytes(),
             self.sender.as_bytes(),
@@ -280,8 +286,44 @@ impl CuttlefishTlkShare {
             &self.curve.to_le_bytes()[..],
             &self.epoch.to_le_bytes()[..],
             &self.poisoned.to_le_bytes()[..],
-        ].concat()
+        ].concat();
+
+        let mut extras = BTreeMap::new();
+        for field in fields {
+            let Some(name) = field.identifier.as_ref().and_then(|i| i.name.as_deref()) else { continue };
+            if Self::KNOWN_KEYS.contains(&name) || name.starts_with("server_") { continue }
+            if let Some(bytes) = field.value.as_ref().and_then(tlkshare_extra_signing_bytes) {
+                extras.insert(name, bytes);
+            }
+        }
+        for bytes in extras.into_values() {
+            data.extend(bytes);
+        }
+        data
     }
+}
+
+/// How dataForSigning serializes an extra field; None for the kinds it skips (references, lists, assets, locations).
+fn tlkshare_extra_signing_bytes(value: &cloudkit_proto::record::field::Value) -> Option<Vec<u8>> {
+    if let Some(s) = &value.string_value {
+        return Some(s.as_bytes().to_vec());
+    }
+    if let Some(b) = &value.bytes_value {
+        return Some(b.clone());
+    }
+    if let Some(date) = &value.date_value {
+        // CloudKit counts from 2001, not 1970; NSISO8601DateFormatter prints whole seconds in UTC
+        let unix = date.time? + 978307200.0;
+        return Some(DateTime::from_timestamp(unix.floor() as i64, 0)?.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
+    }
+    // NSNumber goes in as unsignedLongLongValue: two's complement for integers, truncated for doubles
+    if let Some(i) = value.signed_value {
+        return Some(i.to_le_bytes().to_vec());
+    }
+    if let Some(d) = value.double_value {
+        return Some((d as u64).to_le_bytes().to_vec());
+    }
+    None
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1893,13 +1935,19 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 warn!("Missing key!");
                 continue;
             };
-            let item = CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
+            let record_fields = &share_record.inner.as_ref().unwrap().record_field;
+            let item = CuttlefishTlkShare::from_record(record_fields);
 
             let Some(sending_peer) = state.state.get(&item.sender) else {  
                 warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
                 continue
             };
-            sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
+            if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
+                // Names only: the values are key material. The names show which field a mismatch came from.
+                let names: Vec<_> = record_fields.iter().filter_map(|f| f.identifier.as_ref()?.name.as_deref()).collect();
+                warn!("TLK share for {} failed its signature check; record fields {:?}", share.service(), names);
+                return Err(e);
+            }
 
 
             let decoded = KeyedArchive::expand(&base64_decode(&item.wrappedkey))?;
@@ -2437,5 +2485,143 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let dec = decrypt(Cipher::aes_128_cbc(), &derived_key, Some(&payloads[1][..16]), &payloads[3])?;
 
         Ok(dec)
+    }
+}
+
+#[cfg(test)]
+mod tlkshare_signing_tests {
+    use super::*;
+    use cloudkit_proto::record::field::{Identifier as FieldIdentifier, Value as CkValue};
+
+    // The expected payloads below are built by hand from -[CKKSTLKShare dataForSigning:]
+    // (apple-oss-distributions/Security, keychain/ckks/CKKSTLKShare.m), not from our code.
+
+    const WRAPPED_TLK: &[u8] = b"wrapped-tlk";
+
+    fn field(name: &str, value: CkValue) -> Field {
+        Field { identifier: Some(FieldIdentifier { name: Some(name.to_string()) }), value: Some(value) }
+    }
+
+    fn string(s: &str) -> CkValue {
+        CkValue { string_value: Some(s.to_string()), ..Default::default() }
+    }
+
+    fn bytes(b: &[u8]) -> CkValue {
+        CkValue { bytes_value: Some(b.to_vec()), ..Default::default() }
+    }
+
+    fn int(i: i64) -> CkValue {
+        CkValue { signed_value: Some(i), ..Default::default() }
+    }
+
+    fn double(d: f64) -> CkValue {
+        CkValue { double_value: Some(d), ..Default::default() }
+    }
+
+    fn date(secs_since_2001: f64) -> CkValue {
+        CkValue { date_value: Some(cloudkit_proto::Date { time: Some(secs_since_2001) }), ..Default::default() }
+    }
+
+    fn reference() -> CkValue {
+        CkValue { reference_value: Some(Reference::default()), ..Default::default() }
+    }
+
+    /// Every field CKKS itself writes on a tlkshare record.
+    fn share_record(extras: Vec<Field>) -> Vec<Field> {
+        let mut fields = vec![
+            field("version", int(1)),
+            field("receiver", string("receiver-peer")),
+            field("sender", string("sender-peer")),
+            field("wrappedkey", string(&base64_encode(WRAPPED_TLK))),
+            field("curve", int(4)),
+            field("epoch", int(1)),
+            field("poisoned", int(0)),
+            field("receiverPublicEncryptionKey", string(&base64_encode(b"receiver-key"))),
+            field("signature", string(&base64_encode(b"signature"))),
+            field("parentkeyref", reference()),
+        ];
+        fields.extend(extras);
+        fields
+    }
+
+    fn apple_positional_payload() -> Vec<u8> {
+        [
+            &1u64.to_le_bytes()[..],
+            b"receiver-peer",
+            b"sender-peer",
+            WRAPPED_TLK,
+            &4u64.to_le_bytes()[..],
+            &1u64.to_le_bytes()[..],
+            &0u64.to_le_bytes()[..],
+        ].concat()
+    }
+
+    fn apple_payload_with(extra: &[u8]) -> Vec<u8> {
+        [apple_positional_payload(), extra.to_vec()].concat()
+    }
+
+    fn signing_payload(fields: &[Field]) -> Vec<u8> {
+        CuttlefishTlkShare::from_record(fields).data_for_signing(fields)
+    }
+
+    #[test]
+    fn share_signed_over_an_extra_field_verifies() {
+        // A share whose record carries one field this code has never heard of, signed the way
+        // an Apple device signs it. Before the extras were signed, every such share failed
+        // verification and aborted the whole keychain join.
+        let key = PKey::from_ec_key(EcKey::generate(&EcGroup::from_curve_name(Nid::SECP384R1).unwrap()).unwrap()).unwrap();
+        let fields = share_record(vec![field("someFutureField", bytes(b"proof"))]);
+
+        let mut signer = Signer::new(MessageDigest::sha256(), &key).unwrap();
+        signer.update(&apple_payload_with(b"proof")).unwrap();
+        let signature = signer.sign_to_vec().unwrap();
+
+        let mut verifier = Verifier::new(MessageDigest::sha256(), &key).unwrap();
+        verifier.update(&signing_payload(&fields)).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+    }
+
+    #[test]
+    fn record_without_extras_signs_only_the_positional_fields() {
+        // Accounts that already join today have no extras; the known keys, including the
+        // signature itself and the parent key reference, must stay out of the payload.
+        assert_eq!(signing_payload(&share_record(vec![])), apple_positional_payload());
+    }
+
+    #[test]
+    fn extras_are_signed_in_key_order_and_server_fields_are_not() {
+        let fields = share_record(vec![
+            field("zeta", string("Z")),
+            field("server_modified", string("S")),
+            field("alpha", string("A")),
+        ]);
+        assert_eq!(signing_payload(&fields), apple_payload_with(b"AZ"));
+    }
+
+    #[test]
+    fn a_date_extra_is_signed_as_iso8601_counted_from_2001() {
+        // CloudKit dates count seconds from 2001-01-01, and NSISO8601DateFormatter prints whole
+        // seconds in UTC. Reading the value as Unix time would sign "1970-01-01T00:00:00Z".
+        assert_eq!(signing_payload(&share_record(vec![field("created", date(0.0))])), apple_payload_with(b"2001-01-01T00:00:00Z"));
+        assert_eq!(signing_payload(&share_record(vec![field("created", date(1.75))])), apple_payload_with(b"2001-01-01T00:00:01Z"));
+    }
+
+    #[test]
+    fn numeric_extras_are_signed_as_eight_little_endian_bytes() {
+        // NSNumber goes in via unsignedLongLongValue: two's complement for a negative
+        // integer, truncation towards zero for a double.
+        assert_eq!(signing_payload(&share_record(vec![field("n", int(7))])), apple_payload_with(&7u64.to_le_bytes()));
+        assert_eq!(signing_payload(&share_record(vec![field("n", int(-1))])), apple_payload_with(&[0xff; 8]));
+        assert_eq!(signing_payload(&share_record(vec![field("n", double(2.9))])), apple_payload_with(&2u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn extras_apple_does_not_sign_are_skipped() {
+        let fields = share_record(vec![
+            field("aReference", reference()),
+            field("aList", CkValue { list_values: vec![string("item")], ..Default::default() }),
+            field("anAsset", CkValue { asset_value: Some(cloudkit_proto::Asset::default()), ..Default::default() }),
+        ]);
+        assert_eq!(signing_payload(&fields), apple_positional_payload());
     }
 }
