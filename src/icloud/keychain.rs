@@ -131,41 +131,21 @@ impl CuttlefishEncItem {
             aad.insert("pcspublickey".to_string(), pcspublickey.to_vec());
         }
 
+        // -[CKKSItem makeAuthenticatedDataDictionaryUpdatingCKKSItemEncVer2:] adds every field it
+        // doesn't know (bar server_*), serialized the same way a TLK share signs its extras.
         for field in fields {
-            let name = field.identifier.as_ref().unwrap().name();
-            match name {
-                "gen" | "pcspublickey" | "UUID" | "data" | "pcsservice" | "pcspublicidentity" | "parentkeyref" | "uploadver" | "wrappedkey" | "encver" => continue,
-                _name => {
-                    if _name.starts_with("server_") { continue }
-                    let val = field.value.as_ref().unwrap();
-                    if let Some(string) = &val.string_value {
-                        aad.insert(_name.to_string(), string.as_bytes().to_vec());
-                    }
-                    if let Some(bytes) = &val.bytes_value {
-                        aad.insert(_name.to_string(), bytes.clone());
-                    }
-                    if let Some(date) = &val.date_value {
-                        let time = date.time();
-
-                        let secs = time.trunc() as i64;
-                        let nanos = (time.fract() * 1e9) as u32;
-
-                        let timestamp = DateTime::from_timestamp(secs, nanos)
-                            .expect("Invalid timestamp");
-                        aad.insert(_name.to_string(), timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
-                    }
-                    if let Some(i) = &val.signed_value {
-                        aad.insert(_name.to_string(), i.to_le_bytes().to_vec());
-                    }
-                    if let Some(i) = &val.double_value {
-                        aad.insert(_name.to_string(), (*i as u64).to_le_bytes().to_vec());
-                    }
-                }
+            let Some(name) = field.identifier.as_ref().and_then(|i| i.name.as_deref()) else { continue };
+            if Self::AAD_KNOWN_KEYS.contains(&name) || name.starts_with("server_") { continue }
+            if let Some(bytes) = field.value.as_ref().and_then(ckks_extra_field_bytes) {
+                aad.insert(name.to_string(), bytes);
             }
         }
 
         aad
     }
+
+    /// The record keys the v2 AAD builds itself or leaves out; every other key is authenticated as an extra.
+    const AAD_KNOWN_KEYS: &'static [&'static str] = &["gen", "pcspublickey", "UUID", "data", "pcsservice", "pcspublicidentity", "parentkeyref", "uploadver", "wrappedkey", "encver"];
 
     fn authenticated_data_v1(&self, uuid: &str) -> BTreeMap<String, Vec<u8>> {
         info!("AAD v1");
@@ -292,7 +272,7 @@ impl CuttlefishTlkShare {
         for field in fields {
             let Some(name) = field.identifier.as_ref().and_then(|i| i.name.as_deref()) else { continue };
             if Self::KNOWN_KEYS.contains(&name) || name.starts_with("server_") { continue }
-            if let Some(bytes) = field.value.as_ref().and_then(tlkshare_extra_signing_bytes) {
+            if let Some(bytes) = field.value.as_ref().and_then(ckks_extra_field_bytes) {
                 extras.insert(name, bytes);
             }
         }
@@ -303,8 +283,9 @@ impl CuttlefishTlkShare {
     }
 }
 
-/// How dataForSigning serializes an extra field; None for the kinds it skips (references, lists, assets, locations).
-fn tlkshare_extra_signing_bytes(value: &cloudkit_proto::record::field::Value) -> Option<Vec<u8>> {
+/// How CKKS serializes a record field it doesn't know, both in -[CKKSTLKShare dataForSigning:] and in
+/// an item's v2 authenticated data; None for the kinds it skips (references, lists, assets, locations).
+fn ckks_extra_field_bytes(value: &cloudkit_proto::record::field::Value) -> Option<Vec<u8>> {
     if let Some(s) = &value.string_value {
         return Some(s.as_bytes().to_vec());
     }
@@ -2684,5 +2665,42 @@ mod tlkshare_signing_tests {
             field("anAsset", CkValue { asset_value: Some(cloudkit_proto::Asset::default()), ..Default::default() }),
         ]);
         assert_eq!(signing_payload(&fields), apple_positional_payload());
+    }
+
+    #[test]
+    fn an_items_v2_aad_serializes_unknown_fields_like_a_tlk_share() {
+        // -[CKKSItem makeAuthenticatedDataDictionaryUpdatingCKKSItemEncVer2:] uses the same rules as
+        // dataForSigning. Reading the date as Unix time or saturating the double would fail decryption.
+        let item = CuttlefishEncItem {
+            r#gen: 3,
+            encver: 2,
+            parentkeyref: Reference {
+                record_identifier: Some(cloudkit_proto::RecordIdentifier {
+                    value: Some(cloudkit_proto::Identifier { name: Some("parent-key".to_string()), ..Default::default() }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fields = vec![
+            field("gen", int(3)),
+            field("encver", int(2)),
+            field("uploadver", string("iphone")),
+            field("parentkeyref", reference()),
+            field("server_modified", string("S")),
+            field("aReference", reference()),
+            field("created", date(0.0)),
+            field("n", double(-2.0)),
+        ];
+        let expected = BTreeMap::from_iter([
+            ("UUID", b"item-uuid".to_vec()),
+            ("encver", 2u64.to_le_bytes().to_vec()),
+            ("gen", 3u64.to_le_bytes().to_vec()),
+            ("wrappedkey", b"parent-key".to_vec()),
+            ("created", b"2001-01-01T00:00:00Z".to_vec()),
+            ("n", 0xffff_ffff_ffff_fffeu64.to_le_bytes().to_vec()),
+        ].map(|(k, v)| (k.to_string(), v)));
+        assert_eq!(item.authenticated_data_v2("item-uuid", &fields), expected);
     }
 }
