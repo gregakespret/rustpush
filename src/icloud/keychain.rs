@@ -1952,6 +1952,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         }).await?;
 
         let mut keys = vec![];
+        let mut first_failure = None;
         let state = self.state.read().await;
         for share in response.shares {
             info!("Entering on key {}", share.service());
@@ -1966,11 +1967,14 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
                 continue
             };
+            // Like CKKS, leave a share we can't verify untrusted and carry on: one bad share
+            // shouldn't throw away the TLKs for every other zone.
             if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
                 // Names only: the values are key material. The names show which field a mismatch came from.
                 let names: Vec<_> = record_fields.iter().filter_map(|f| f.identifier.as_ref()?.name.as_deref()).collect();
-                warn!("TLK share for {} failed its signature check ({e}); record fields {:?}", share.service(), names);
-                return Err(e);
+                warn!("Skipping TLK share for {}: it failed its signature check ({e}); record fields {:?}", share.service(), names);
+                first_failure.get_or_insert(e);
+                continue;
             }
 
 
@@ -2003,6 +2007,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             keys.push(result);
         }
 
+        // With nothing verified, the signature error says more than an empty list would.
+        if keys.is_empty() {
+            if let Some(e) = first_failure {
+                return Err(e);
+            }
+        }
         Ok(keys)
     }
 
