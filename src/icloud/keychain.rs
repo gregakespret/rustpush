@@ -312,20 +312,42 @@ fn tlkshare_extra_signing_bytes(value: &cloudkit_proto::record::field::Value) ->
         return Some(b.clone());
     }
     if let Some(date) = &value.date_value {
-        // CloudKit counts from 2001, not 1970; NSISO8601DateFormatter prints whole seconds in UTC
-        let unix = date.time? + 978307200.0;
-        return Some(DateTime::from_timestamp(unix.floor() as i64, 0)?.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
+        // CloudKit counts from 2001, not 1970. NSISO8601DateFormatter prints whole seconds in UTC, but
+        // CFDateFormatter first rounds to the nearest millisecond ((t + 978307200) * 1000 + 0.5), so the
+        // last half-millisecond of a second prints as the next second.
+        let millis = ((date.time? + 978307200.0) * 1000.0 + 0.5).floor() as i64;
+        return Some(DateTime::from_timestamp_millis(millis)?.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
     }
-    // NSNumber goes in as unsignedLongLongValue: two's complement for integers, negative doubles
-    // saturate to UINT64_MAX, and non-negative doubles truncate towards zero.
+    // NSNumber goes in as unsignedLongLongValue: two's complement for an integer.
     if let Some(i) = value.signed_value {
         return Some(i.to_le_bytes().to_vec());
     }
     if let Some(d) = value.double_value {
-        let unsigned = if d < 0.0 { u64::MAX } else { d as u64 };
-        return Some(unsigned.to_le_bytes().to_vec());
+        return Some(nsnumber_double_unsigned_long_long(d).to_le_bytes().to_vec());
     }
     None
+}
+
+/// `[[NSNumber numberWithDouble:d] unsignedLongLongValue]`, matched against Foundation on arm64.
+/// Foundation keeps a whole double below 2^55 as a tagged integer, which reads back as two's
+/// complement. Any other double goes through CFNumber's 128-bit conversion and keeps the low
+/// 64 bits; that last cast saturates exactly like `as u64`. Intel Macs return 0x8000000000000000
+/// instead for NaN and for negative fractions above about -1024.
+fn nsnumber_double_unsigned_long_long(d: f64) -> u64 {
+    const TWO_55: f64 = 36028797018963968.0;
+    const TWO_64: f64 = 18446744073709551616.0;
+    const TWO_127: f64 = 170141183460469231731687303715884105728.0;
+    if d.fract() == 0.0 && d.abs() < TWO_55 {
+        return d as i64 as u64;
+    }
+    if d.is_nan() || d < -TWO_127 {
+        return 0;
+    }
+    if d >= TWO_127 {
+        return u64::MAX;
+    }
+    let high = (d / TWO_64).floor();
+    (d - high * TWO_64) as u64
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1947,7 +1969,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
                 // Names only: the values are key material. The names show which field a mismatch came from.
                 let names: Vec<_> = record_fields.iter().filter_map(|f| f.identifier.as_ref()?.name.as_deref()).collect();
-                warn!("TLK share for {} failed its signature check; record fields {:?}", share.service(), names);
+                warn!("TLK share for {} failed its signature check ({e}); record fields {:?}", share.service(), names);
                 return Err(e);
             }
 
@@ -2609,17 +2631,39 @@ mod tlkshare_signing_tests {
     }
 
     #[test]
+    fn a_date_extra_rounds_to_the_millisecond_before_dropping_the_fraction() {
+        // CFDateFormatter rounds to the nearest millisecond before it prints whole seconds.
+        // Expected strings measured with NSISO8601DateFormatter on macOS.
+        let signed = |t: f64| signing_payload(&share_record(vec![field("created", date(t))]));
+        assert_eq!(signed(1.9994), apple_payload_with(b"2001-01-01T00:00:01Z"));
+        assert_eq!(signed(1.9995), apple_payload_with(b"2001-01-01T00:00:02Z"));
+        assert_eq!(signed(-0.0001), apple_payload_with(b"2001-01-01T00:00:00Z"));
+        assert_eq!(signed(-0.5), apple_payload_with(b"2000-12-31T23:59:59Z"));
+    }
+
+    #[test]
     fn numeric_extras_are_signed_as_eight_little_endian_bytes() {
         // NSNumber goes in via unsignedLongLongValue: two's complement for a negative
-        // integer, truncation towards zero for a double.
+        // integer, truncation towards zero for a small positive double.
         assert_eq!(signing_payload(&share_record(vec![field("n", int(7))])), apple_payload_with(&7u64.to_le_bytes()));
         assert_eq!(signing_payload(&share_record(vec![field("n", int(-1))])), apple_payload_with(&[0xff; 8]));
         assert_eq!(signing_payload(&share_record(vec![field("n", double(2.9))])), apple_payload_with(&2u64.to_le_bytes()));
     }
 
     #[test]
-    fn a_negative_double_extra_uses_nsnumber_unsigned_saturation() {
-        assert_eq!(signing_payload(&share_record(vec![field("n", double(-2.9))])), apple_payload_with(&[0xff; 8]));
+    fn double_extras_match_nsnumber_unsigned_long_long() {
+        // [[NSNumber numberWithDouble:d] unsignedLongLongValue], measured on an arm64 Mac. A whole
+        // double below 2^55 reads back as two's complement; anything else keeps the low 64 bits
+        // of a 128-bit conversion, so negative doubles do not all saturate.
+        let signed = |d: f64| signing_payload(&share_record(vec![field("n", double(d))]));
+        assert_eq!(signed(-2.0), apple_payload_with(&0xffff_ffff_ffff_fffeu64.to_le_bytes()));
+        assert_eq!(signed(-1e5), apple_payload_with(&0xffff_ffff_fffe_7960u64.to_le_bytes()));
+        assert_eq!(signed(-2.9), apple_payload_with(&[0xff; 8]));
+        assert_eq!(signed(-1024.5), apple_payload_with(&0xffff_ffff_ffff_f800u64.to_le_bytes()));
+        assert_eq!(signed(1e20), apple_payload_with(&0x6bc7_5e2d_6310_0000u64.to_le_bytes()));
+        assert_eq!(signed(18446744073709551616.0), apple_payload_with(&0u64.to_le_bytes()));
+        assert_eq!(signed(f64::INFINITY), apple_payload_with(&[0xff; 8]));
+        assert_eq!(signed(f64::NEG_INFINITY), apple_payload_with(&0u64.to_le_bytes()));
     }
 
     #[test]
