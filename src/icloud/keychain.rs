@@ -1031,6 +1031,10 @@ impl KeychainKeyStore {
     pub fn get_key_id(&self, uuid: &str) -> Option<&CloudKey> {
         self.0.iter().find(|k| k.uuid == uuid)
     }
+
+    fn has_zone(&self, zone: &str) -> bool {
+        self.0.iter().any(|k| k.zone_name == zone)
+    }
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct SavedKeychainZone {
@@ -1401,11 +1405,19 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             return Err(PushError::NotInClique)
         }
 
+        // A share we couldn't verify is skipped, so a zone can be left without a key. Ask for the
+        // shares again until it has one, rather than only when the key store is empty.
         let state = self.state.read().await;
-        if state.keystore.0.is_empty() {
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
+        if zones.iter().any(|zone| !state.keystore.has_zone(zone)) {
+            let had_keys = !state.keystore.0.is_empty();
+            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await;
             drop(state);
-            self.store_keys(&shares).await?;
+            match shares {
+                Ok(shares) => self.store_keys(&shares).await?,
+                // The zones we already hold keys for can still sync.
+                Err(e) if had_keys => warn!("Couldn't refetch TLK shares for a zone without a key: {e}"),
+                Err(e) => return Err(e),
+            }
         } else {
             drop(state);
         }
@@ -1428,7 +1440,9 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         for (zone, (_, changes, change)) in zones.iter().zip(item.into_iter()) {
             let saved_keychain_zone = state.items.entry(zone.to_string()).or_default();
-            saved_keychain_zone.change_tag = change.clone().map(|i| i.into());
+            // An item whose key we don't have yet must come back on the next sync, so the zone
+            // keeps its old change tag until every item in it has decrypted.
+            let mut missing_key = false;
             for change in changes {
                 let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
                 let Some(record) = change.record else {
@@ -1438,9 +1452,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 };
                 if record.r#type.as_ref().unwrap().name() == CuttlefishEncItem::record_type() {
                     let item = CuttlefishEncItem::from_record(&record.record_field);
-                    let Ok(mut decoded) = item.decrypt(&identifier, &record, &state.keystore, &cloudkey_access) else {
-                        warn!("Missing decryption key for {}", identifier);
-                        continue;
+                    let mut decoded = match item.decrypt(&identifier, &record, &state.keystore, &cloudkey_access) {
+                        Ok(decoded) => decoded,
+                        Err(e) => {
+                            warn!("Couldn't decrypt {}: {e}", identifier);
+                            missing_key |= matches!(e, PushError::DecryptionKeyNotFound(_));
+                            continue;
+                        }
                     };
 
                     encrypt_entry(&mut decoded, &keychain_access);
@@ -1451,6 +1469,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
                     saved_keychain_zone.current_keys.insert(identifier, record);
                 }
+            }
+            if missing_key {
+                warn!("Keeping the old change tag for {zone} until its missing keys arrive");
+            } else {
+                saved_keychain_zone.change_tag = change.map(|i| i.into());
             }
         }
 
