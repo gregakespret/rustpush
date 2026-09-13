@@ -131,41 +131,21 @@ impl CuttlefishEncItem {
             aad.insert("pcspublickey".to_string(), pcspublickey.to_vec());
         }
 
+        // -[CKKSItem makeAuthenticatedDataDictionaryUpdatingCKKSItemEncVer2:] adds every field it
+        // doesn't know (bar server_*), serialized the same way a TLK share signs its extras.
         for field in fields {
-            let name = field.identifier.as_ref().unwrap().name();
-            match name {
-                "gen" | "pcspublickey" | "UUID" | "data" | "pcsservice" | "pcspublicidentity" | "parentkeyref" | "uploadver" | "wrappedkey" | "encver" => continue,
-                _name => {
-                    if _name.starts_with("server_") { continue }
-                    let val = field.value.as_ref().unwrap();
-                    if let Some(string) = &val.string_value {
-                        aad.insert(_name.to_string(), string.as_bytes().to_vec());
-                    }
-                    if let Some(bytes) = &val.bytes_value {
-                        aad.insert(_name.to_string(), bytes.clone());
-                    }
-                    if let Some(date) = &val.date_value {
-                        let time = date.time();
-
-                        let secs = time.trunc() as i64;
-                        let nanos = (time.fract() * 1e9) as u32;
-
-                        let timestamp = DateTime::from_timestamp(secs, nanos)
-                            .expect("Invalid timestamp");
-                        aad.insert(_name.to_string(), timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
-                    }
-                    if let Some(i) = &val.signed_value {
-                        aad.insert(_name.to_string(), i.to_le_bytes().to_vec());
-                    }
-                    if let Some(i) = &val.double_value {
-                        aad.insert(_name.to_string(), (*i as u64).to_le_bytes().to_vec());
-                    }
-                }
+            let Some(name) = field.identifier.as_ref().and_then(|i| i.name.as_deref()) else { continue };
+            if Self::AAD_KNOWN_KEYS.contains(&name) || name.starts_with("server_") { continue }
+            if let Some(bytes) = field.value.as_ref().and_then(ckks_extra_field_bytes) {
+                aad.insert(name.to_string(), bytes);
             }
         }
 
         aad
     }
+
+    /// The record keys the v2 AAD builds itself or leaves out; every other key is authenticated as an extra.
+    const AAD_KNOWN_KEYS: &'static [&'static str] = &["gen", "pcspublickey", "UUID", "data", "pcsservice", "pcspublicidentity", "parentkeyref", "uploadver", "wrappedkey", "encver"];
 
     fn authenticated_data_v1(&self, uuid: &str) -> BTreeMap<String, Vec<u8>> {
         info!("AAD v1");
@@ -271,8 +251,14 @@ pub struct CuttlefishTlkShare {
 }
 
 impl CuttlefishTlkShare {
-    fn data_for_signing(&self) -> Vec<u8> {
-        [
+    /// The record keys -[CKKSTLKShare dataForSigning:] knows about; every other key is signed as an extra.
+    const KNOWN_KEYS: &'static [&'static str] = &["sender", "receiver", "receiverPublicEncryptionKey", "curve", "epoch", "poisoned", "signature", "version", "parentkeyref", "wrappedkey"];
+
+    // `fields` is the record this share was decoded from. Apple signs every field it doesn't know
+    // (bar server_*) after the positional ones, sorted by key, so a newer device can add fields
+    // without breaking older verifiers. Leaving them out fails every share that carries one.
+    fn data_for_signing(&self, fields: &[Field]) -> Vec<u8> {
+        let mut data = [
             &self.version.to_le_bytes()[..],
             self.receiver.as_bytes(),
             self.sender.as_bytes(),
@@ -280,8 +266,69 @@ impl CuttlefishTlkShare {
             &self.curve.to_le_bytes()[..],
             &self.epoch.to_le_bytes()[..],
             &self.poisoned.to_le_bytes()[..],
-        ].concat()
+        ].concat();
+
+        let mut extras = BTreeMap::new();
+        for field in fields {
+            let Some(name) = field.identifier.as_ref().and_then(|i| i.name.as_deref()) else { continue };
+            if Self::KNOWN_KEYS.contains(&name) || name.starts_with("server_") { continue }
+            if let Some(bytes) = field.value.as_ref().and_then(ckks_extra_field_bytes) {
+                extras.insert(name, bytes);
+            }
+        }
+        for bytes in extras.into_values() {
+            data.extend(bytes);
+        }
+        data
     }
+}
+
+/// How CKKS serializes a record field it doesn't know, both in -[CKKSTLKShare dataForSigning:] and in
+/// an item's v2 authenticated data; None for the kinds it skips (references, lists, assets, locations).
+fn ckks_extra_field_bytes(value: &cloudkit_proto::record::field::Value) -> Option<Vec<u8>> {
+    if let Some(s) = &value.string_value {
+        return Some(s.as_bytes().to_vec());
+    }
+    if let Some(b) = &value.bytes_value {
+        return Some(b.clone());
+    }
+    if let Some(date) = &value.date_value {
+        // CloudKit counts from 2001, not 1970. NSISO8601DateFormatter prints whole seconds in UTC, but
+        // CFDateFormatter first rounds to the nearest millisecond ((t + 978307200) * 1000 + 0.5), so the
+        // last half-millisecond of a second prints as the next second.
+        let millis = ((date.time? + 978307200.0) * 1000.0 + 0.5).floor() as i64;
+        return Some(DateTime::from_timestamp_millis(millis)?.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into_bytes());
+    }
+    // NSNumber goes in as unsignedLongLongValue: two's complement for an integer.
+    if let Some(i) = value.signed_value {
+        return Some(i.to_le_bytes().to_vec());
+    }
+    if let Some(d) = value.double_value {
+        return Some(nsnumber_double_unsigned_long_long(d).to_le_bytes().to_vec());
+    }
+    None
+}
+
+/// `[[NSNumber numberWithDouble:d] unsignedLongLongValue]`, matched against Foundation on arm64.
+/// Foundation keeps a whole double below 2^55 as a tagged integer, which reads back as two's
+/// complement. Any other double goes through CFNumber's 128-bit conversion and keeps the low
+/// 64 bits; that last cast saturates exactly like `as u64`. Intel Macs return 0x8000000000000000
+/// instead for NaN and for negative fractions above about -1024.
+fn nsnumber_double_unsigned_long_long(d: f64) -> u64 {
+    const TWO_55: f64 = 36028797018963968.0;
+    const TWO_64: f64 = 18446744073709551616.0;
+    const TWO_127: f64 = 170141183460469231731687303715884105728.0;
+    if d.fract() == 0.0 && d.abs() < TWO_55 {
+        return d as i64 as u64;
+    }
+    if d.is_nan() || d < -TWO_127 {
+        return 0;
+    }
+    if d >= TWO_127 {
+        return u64::MAX;
+    }
+    let high = (d / TWO_64).floor();
+    (d - high * TWO_64) as u64
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -984,6 +1031,10 @@ impl KeychainKeyStore {
     pub fn get_key_id(&self, uuid: &str) -> Option<&CloudKey> {
         self.0.iter().find(|k| k.uuid == uuid)
     }
+
+    fn has_zone(&self, zone: &str) -> bool {
+        self.0.iter().any(|k| k.zone_name == zone)
+    }
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct SavedKeychainZone {
@@ -1354,11 +1405,19 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             return Err(PushError::NotInClique)
         }
 
+        // A share we couldn't verify is skipped, so a zone can be left without a key. Ask for the
+        // shares again until it has one, rather than only when the key store is empty.
         let state = self.state.read().await;
-        if state.keystore.0.is_empty() {
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
+        if zones.iter().any(|zone| !state.keystore.has_zone(zone)) {
+            let had_keys = !state.keystore.0.is_empty();
+            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await;
             drop(state);
-            self.store_keys(&shares).await?;
+            match shares {
+                Ok(shares) => self.store_keys(&shares).await?,
+                // The zones we already hold keys for can still sync.
+                Err(e) if had_keys => warn!("Couldn't refetch TLK shares for a zone without a key: {e}"),
+                Err(e) => return Err(e),
+            }
         } else {
             drop(state);
         }
@@ -1381,7 +1440,9 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         for (zone, (_, changes, change)) in zones.iter().zip(item.into_iter()) {
             let saved_keychain_zone = state.items.entry(zone.to_string()).or_default();
-            saved_keychain_zone.change_tag = change.clone().map(|i| i.into());
+            // An item whose key we don't have yet must come back on the next sync, so the zone
+            // keeps its old change tag until every item in it has decrypted.
+            let mut missing_key = false;
             for change in changes {
                 let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
                 let Some(record) = change.record else {
@@ -1391,9 +1452,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 };
                 if record.r#type.as_ref().unwrap().name() == CuttlefishEncItem::record_type() {
                     let item = CuttlefishEncItem::from_record(&record.record_field);
-                    let Ok(mut decoded) = item.decrypt(&identifier, &record, &state.keystore, &cloudkey_access) else {
-                        warn!("Missing decryption key for {}", identifier);
-                        continue;
+                    let mut decoded = match item.decrypt(&identifier, &record, &state.keystore, &cloudkey_access) {
+                        Ok(decoded) => decoded,
+                        Err(e) => {
+                            warn!("Couldn't decrypt {}: {e}", identifier);
+                            missing_key |= matches!(e, PushError::DecryptionKeyNotFound(_));
+                            continue;
+                        }
                     };
 
                     encrypt_entry(&mut decoded, &keychain_access);
@@ -1404,6 +1469,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
                     saved_keychain_zone.current_keys.insert(identifier, record);
                 }
+            }
+            if missing_key {
+                warn!("Keeping the old change tag for {zone} until its missing keys arrive");
+            } else {
+                saved_keychain_zone.change_tag = change.map(|i| i.into());
             }
         }
 
@@ -1886,6 +1956,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         }).await?;
 
         let mut keys = vec![];
+        let mut first_failure = None;
         let state = self.state.read().await;
         for share in response.shares {
             info!("Entering on key {}", share.service());
@@ -1893,13 +1964,22 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 warn!("Missing key!");
                 continue;
             };
-            let item = CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
+            let record_fields = &share_record.inner.as_ref().unwrap().record_field;
+            let item = CuttlefishTlkShare::from_record(record_fields);
 
             let Some(sending_peer) = state.state.get(&item.sender) else {  
                 warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
                 continue
             };
-            sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
+            // Like CKKS, leave a share we can't verify untrusted and carry on: one bad share
+            // shouldn't throw away the TLKs for every other zone.
+            if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
+                // Names only: the values are key material. The names show which field a mismatch came from.
+                let names: Vec<_> = record_fields.iter().filter_map(|f| f.identifier.as_ref()?.name.as_deref()).collect();
+                warn!("Skipping TLK share for {}: it failed its signature check ({e}); record fields {:?}", share.service(), names);
+                first_failure.get_or_insert(e);
+                continue;
+            }
 
 
             let decoded = KeyedArchive::expand(&base64_decode(&item.wrappedkey))?;
@@ -1931,6 +2011,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             keys.push(result);
         }
 
+        // With nothing verified, the signature error says more than an empty list would.
+        if keys.is_empty() {
+            if let Some(e) = first_failure {
+                return Err(e);
+            }
+        }
         Ok(keys)
     }
 
@@ -2437,5 +2523,207 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let dec = decrypt(Cipher::aes_128_cbc(), &derived_key, Some(&payloads[1][..16]), &payloads[3])?;
 
         Ok(dec)
+    }
+}
+
+#[cfg(test)]
+mod tlkshare_signing_tests {
+    use super::*;
+    use cloudkit_proto::record::field::{Identifier as FieldIdentifier, Value as CkValue};
+
+    // The expected payloads below are built by hand from -[CKKSTLKShare dataForSigning:]
+    // (apple-oss-distributions/Security, keychain/ckks/CKKSTLKShare.m), not from our code.
+
+    const WRAPPED_TLK: &[u8] = b"wrapped-tlk";
+
+    fn field(name: &str, value: CkValue) -> Field {
+        Field { identifier: Some(FieldIdentifier { name: Some(name.to_string()) }), value: Some(value) }
+    }
+
+    fn string(s: &str) -> CkValue {
+        CkValue { string_value: Some(s.to_string()), ..Default::default() }
+    }
+
+    fn bytes(b: &[u8]) -> CkValue {
+        CkValue { bytes_value: Some(b.to_vec()), ..Default::default() }
+    }
+
+    fn int(i: i64) -> CkValue {
+        CkValue { signed_value: Some(i), ..Default::default() }
+    }
+
+    fn double(d: f64) -> CkValue {
+        CkValue { double_value: Some(d), ..Default::default() }
+    }
+
+    fn date(secs_since_2001: f64) -> CkValue {
+        CkValue { date_value: Some(cloudkit_proto::Date { time: Some(secs_since_2001) }), ..Default::default() }
+    }
+
+    fn reference() -> CkValue {
+        CkValue { reference_value: Some(Reference::default()), ..Default::default() }
+    }
+
+    /// Every field CKKS itself writes on a tlkshare record.
+    fn share_record(extras: Vec<Field>) -> Vec<Field> {
+        let mut fields = vec![
+            field("version", int(1)),
+            field("receiver", string("receiver-peer")),
+            field("sender", string("sender-peer")),
+            field("wrappedkey", string(&base64_encode(WRAPPED_TLK))),
+            field("curve", int(4)),
+            field("epoch", int(1)),
+            field("poisoned", int(0)),
+            field("receiverPublicEncryptionKey", string(&base64_encode(b"receiver-key"))),
+            field("signature", string(&base64_encode(b"signature"))),
+            field("parentkeyref", reference()),
+        ];
+        fields.extend(extras);
+        fields
+    }
+
+    fn apple_positional_payload() -> Vec<u8> {
+        [
+            &1u64.to_le_bytes()[..],
+            b"receiver-peer",
+            b"sender-peer",
+            WRAPPED_TLK,
+            &4u64.to_le_bytes()[..],
+            &1u64.to_le_bytes()[..],
+            &0u64.to_le_bytes()[..],
+        ].concat()
+    }
+
+    fn apple_payload_with(extra: &[u8]) -> Vec<u8> {
+        [apple_positional_payload(), extra.to_vec()].concat()
+    }
+
+    fn signing_payload(fields: &[Field]) -> Vec<u8> {
+        CuttlefishTlkShare::from_record(fields).data_for_signing(fields)
+    }
+
+    #[test]
+    fn share_signed_over_an_extra_field_verifies() {
+        // A share whose record carries one field this code has never heard of, signed the way
+        // an Apple device signs it. Before the extras were signed, every such share failed
+        // verification and aborted the whole keychain join.
+        let key = PKey::from_ec_key(EcKey::generate(&EcGroup::from_curve_name(Nid::SECP384R1).unwrap()).unwrap()).unwrap();
+        let fields = share_record(vec![field("someFutureField", bytes(b"proof"))]);
+
+        let mut signer = Signer::new(MessageDigest::sha256(), &key).unwrap();
+        signer.update(&apple_payload_with(b"proof")).unwrap();
+        let signature = signer.sign_to_vec().unwrap();
+
+        let mut verifier = Verifier::new(MessageDigest::sha256(), &key).unwrap();
+        verifier.update(&signing_payload(&fields)).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+    }
+
+    #[test]
+    fn record_without_extras_signs_only_the_positional_fields() {
+        // Accounts that already join today have no extras; the known keys, including the
+        // signature itself and the parent key reference, must stay out of the payload.
+        assert_eq!(signing_payload(&share_record(vec![])), apple_positional_payload());
+    }
+
+    #[test]
+    fn extras_are_signed_in_key_order_and_server_fields_are_not() {
+        let fields = share_record(vec![
+            field("zeta", string("Z")),
+            field("server_modified", string("S")),
+            field("alpha", string("A")),
+        ]);
+        assert_eq!(signing_payload(&fields), apple_payload_with(b"AZ"));
+    }
+
+    #[test]
+    fn a_date_extra_is_signed_as_iso8601_counted_from_2001() {
+        // CloudKit dates count seconds from 2001-01-01, and NSISO8601DateFormatter prints whole
+        // seconds in UTC. Reading the value as Unix time would sign "1970-01-01T00:00:00Z".
+        assert_eq!(signing_payload(&share_record(vec![field("created", date(0.0))])), apple_payload_with(b"2001-01-01T00:00:00Z"));
+        assert_eq!(signing_payload(&share_record(vec![field("created", date(1.75))])), apple_payload_with(b"2001-01-01T00:00:01Z"));
+    }
+
+    #[test]
+    fn a_date_extra_rounds_to_the_millisecond_before_dropping_the_fraction() {
+        // CFDateFormatter rounds to the nearest millisecond before it prints whole seconds.
+        // Expected strings measured with NSISO8601DateFormatter on macOS.
+        let signed = |t: f64| signing_payload(&share_record(vec![field("created", date(t))]));
+        assert_eq!(signed(1.9994), apple_payload_with(b"2001-01-01T00:00:01Z"));
+        assert_eq!(signed(1.9995), apple_payload_with(b"2001-01-01T00:00:02Z"));
+        assert_eq!(signed(-0.0001), apple_payload_with(b"2001-01-01T00:00:00Z"));
+        assert_eq!(signed(-0.5), apple_payload_with(b"2000-12-31T23:59:59Z"));
+    }
+
+    #[test]
+    fn numeric_extras_are_signed_as_eight_little_endian_bytes() {
+        // NSNumber goes in via unsignedLongLongValue: two's complement for a negative
+        // integer, truncation towards zero for a small positive double.
+        assert_eq!(signing_payload(&share_record(vec![field("n", int(7))])), apple_payload_with(&7u64.to_le_bytes()));
+        assert_eq!(signing_payload(&share_record(vec![field("n", int(-1))])), apple_payload_with(&[0xff; 8]));
+        assert_eq!(signing_payload(&share_record(vec![field("n", double(2.9))])), apple_payload_with(&2u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn double_extras_match_nsnumber_unsigned_long_long() {
+        // [[NSNumber numberWithDouble:d] unsignedLongLongValue], measured on an arm64 Mac. A whole
+        // double below 2^55 reads back as two's complement; anything else keeps the low 64 bits
+        // of a 128-bit conversion, so negative doubles do not all saturate.
+        let signed = |d: f64| signing_payload(&share_record(vec![field("n", double(d))]));
+        assert_eq!(signed(-2.0), apple_payload_with(&0xffff_ffff_ffff_fffeu64.to_le_bytes()));
+        assert_eq!(signed(-1e5), apple_payload_with(&0xffff_ffff_fffe_7960u64.to_le_bytes()));
+        assert_eq!(signed(-2.9), apple_payload_with(&[0xff; 8]));
+        assert_eq!(signed(-1024.5), apple_payload_with(&0xffff_ffff_ffff_f800u64.to_le_bytes()));
+        assert_eq!(signed(1e20), apple_payload_with(&0x6bc7_5e2d_6310_0000u64.to_le_bytes()));
+        assert_eq!(signed(18446744073709551616.0), apple_payload_with(&0u64.to_le_bytes()));
+        assert_eq!(signed(f64::INFINITY), apple_payload_with(&[0xff; 8]));
+        assert_eq!(signed(f64::NEG_INFINITY), apple_payload_with(&0u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn extras_apple_does_not_sign_are_skipped() {
+        let fields = share_record(vec![
+            field("aReference", reference()),
+            field("aList", CkValue { list_values: vec![string("item")], ..Default::default() }),
+            field("anAsset", CkValue { asset_value: Some(cloudkit_proto::Asset::default()), ..Default::default() }),
+        ]);
+        assert_eq!(signing_payload(&fields), apple_positional_payload());
+    }
+
+    #[test]
+    fn an_items_v2_aad_serializes_unknown_fields_like_a_tlk_share() {
+        // -[CKKSItem makeAuthenticatedDataDictionaryUpdatingCKKSItemEncVer2:] uses the same rules as
+        // dataForSigning. Reading the date as Unix time or saturating the double would fail decryption.
+        let item = CuttlefishEncItem {
+            r#gen: 3,
+            encver: 2,
+            parentkeyref: Reference {
+                record_identifier: Some(cloudkit_proto::RecordIdentifier {
+                    value: Some(cloudkit_proto::Identifier { name: Some("parent-key".to_string()), ..Default::default() }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fields = vec![
+            field("gen", int(3)),
+            field("encver", int(2)),
+            field("uploadver", string("iphone")),
+            field("parentkeyref", reference()),
+            field("server_modified", string("S")),
+            field("aReference", reference()),
+            field("created", date(0.0)),
+            field("n", double(-2.0)),
+        ];
+        let expected = BTreeMap::from_iter([
+            ("UUID", b"item-uuid".to_vec()),
+            ("encver", 2u64.to_le_bytes().to_vec()),
+            ("gen", 3u64.to_le_bytes().to_vec()),
+            ("wrappedkey", b"parent-key".to_vec()),
+            ("created", b"2001-01-01T00:00:00Z".to_vec()),
+            ("n", 0xffff_ffff_ffff_fffeu64.to_le_bytes().to_vec()),
+        ].map(|(k, v)| (k.to_string(), v)));
+        assert_eq!(item.authenticated_data_v2("item-uuid", &fields), expected);
     }
 }

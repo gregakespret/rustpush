@@ -401,10 +401,9 @@ async fn main() {
         let account = done.lock().await;
 
         // account.update_postdata("Testing").await.unwrap();
-        let pet = account.get_pet().unwrap();
         let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&gsa.user, &pet, spd["adsid"].as_string().unwrap(), None, &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
+        let delegates = login_apple_delegates(&*account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         let mobileme = delegates.mobileme.unwrap();
@@ -608,7 +607,7 @@ async fn main() {
     let passwords = PasswordManager::new(
         keychain.clone(), cloudkit.clone(), client.identity.clone(), connection.clone(), state, Box::new(move |state| {
             plist::to_file_xml("passwords.plist", state).unwrap();
-        })).await;
+        }), Box::new(|_, _| {})).await;
 
 
     if let Some(mut s) = session {
