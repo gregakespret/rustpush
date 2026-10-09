@@ -346,7 +346,7 @@ async fn main() {
         state.users.clone()
     } else {
         // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = || {
+        let tfa_closure = |_sent_to: Option<&str>| {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
@@ -433,7 +433,7 @@ async fn main() {
     let conf = (gsa.user.clone(), gsa.pass.as_ref().to_vec());
     let appleid_closure = move || conf.clone();
         // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = || {
+        let tfa_closure = |_sent_to: Option<&str>| {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
