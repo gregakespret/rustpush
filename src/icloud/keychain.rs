@@ -1124,7 +1124,9 @@ impl KeychainClientState {
     // A zone whose TLK share we skipped (it failed its signature check) or were never sent has no
     // class key, so nothing can be saved into it. That is an error for the caller, not a panic.
     pub fn get_class_key(&self, zone: &str, class: &str) -> Result<&CloudKey, PushError> {
-        self.keystore.get_key(zone, class).ok_or_else(|| PushError::ZoneKeyMissing(zone.to_string()))
+        self.keystore
+            .get_key(zone, class)
+            .ok_or_else(|| PushError::ZoneKeyMissing(zone.to_string()))
     }
 
     // filter out custodian recovery keys
@@ -2739,7 +2741,11 @@ mod class_key_tests {
     use super::*;
 
     fn state_holding(keys: &[(&str, &str)]) -> KeychainClientState {
-        let mut state = KeychainClientState::new_with_host("dsid".to_string(), "adsid".to_string(), "https://escrow.invalid".to_string());
+        let mut state = KeychainClientState::new_with_host(
+            "dsid".to_string(),
+            "adsid".to_string(),
+            "https://escrow.invalid".to_string(),
+        );
         for (zone, class) in keys {
             state.keystore.store_key(CloudKey {
                 uuid: format!("{zone}/{class}"),
@@ -2753,7 +2759,7 @@ mod class_key_tests {
 
     #[test]
     fn a_zone_whose_tlk_share_was_skipped_is_an_error_not_a_panic() {
-        // Every TLK share of one account failed its signature check, so Manatee had no class
+        // One account's Manatee TLK share failed its signature check, so Manatee had no class
         // key. Saving the Find My service key into it hit expect("Insert class key not found")
         // and took the whole export task down. Other zones' keys must not stand in for it.
         let state = state_holding(&[("FindMy", "classC"), ("Manatee", "classA")]);
@@ -2764,6 +2770,9 @@ mod class_key_tests {
     #[test]
     fn a_zone_holding_its_class_key_can_be_saved_into() {
         let state = state_holding(&[("Manatee", "classA"), ("Manatee", "classC")]);
-        assert_eq!(state.get_class_key("Manatee", "classC").unwrap().uuid, "Manatee/classC");
+        assert_eq!(
+            state.get_class_key("Manatee", "classC").unwrap().uuid,
+            "Manatee/classC"
+        );
     }
 }
