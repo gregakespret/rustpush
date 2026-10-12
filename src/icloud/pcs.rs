@@ -226,6 +226,10 @@ impl PCSPrivateKey {
         if let Some(existing) = state.items[service.zone].get_current_key(&format!("com.apple.ProtectedCloudStorage-{}", service.name)) {
             Ok(PCSPrivateKey::from_dict(existing, &state))
         } else {
+            // Without the zone's class key the existing service key can't be read, nor a new one
+            // saved. Stop here, before get_master_key can upload a new master key for a save
+            // that is bound to fail.
+            state.get_class_key(service.zone, "classC")?;
             drop(state);
             let master_key = Self::get_master_key(keychain).await?;
 
