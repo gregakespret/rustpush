@@ -28,7 +28,7 @@ impl SharedStreamsState {
     pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> Option<SharedStreamsState> {
         Some(SharedStreamsState {
             dsid,
-            host: delegate.config.get("com.apple.Dataclass.SharedStreams")?.as_dictionary().unwrap().get("url")?.as_string().unwrap().to_string(),
+            host: crate::icloud::keychain::mme_config_url(delegate, "com.apple.Dataclass.SharedStreams", "url")?,
             albums: vec![],
         })
     }
