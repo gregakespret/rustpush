@@ -1121,6 +1121,14 @@ impl KeychainClientState {
         }
     }
 
+    // A zone whose TLK share we skipped (it failed its signature check) or were never sent has no
+    // class key, so nothing can be saved into it. That is an error for the caller, not a panic.
+    pub fn get_class_key(&self, zone: &str, class: &str) -> Result<&CloudKey, PushError> {
+        self.keystore
+            .get_key(zone, class)
+            .ok_or_else(|| PushError::ZoneKeyMissing(zone.to_string()))
+    }
+
     // filter out custodian recovery keys
     pub fn peers(&self) -> impl Iterator<Item = &EncodedPeer> {
         self.state.values().filter(|v| v.0.dynamic_info.is_some())
@@ -1346,7 +1354,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
-        let key = state.keystore.get_key(zone, class).expect("Insert class key not found");
+        let key = state.get_class_key(zone, class)?;
 
         let record_zone = security_container.private_zone(zone.to_string());
 
@@ -2725,5 +2733,46 @@ mod tlkshare_signing_tests {
             ("n", 0xffff_ffff_ffff_fffeu64.to_le_bytes().to_vec()),
         ].map(|(k, v)| (k.to_string(), v)));
         assert_eq!(item.authenticated_data_v2("item-uuid", &fields), expected);
+    }
+}
+
+#[cfg(test)]
+mod class_key_tests {
+    use super::*;
+
+    fn state_holding(keys: &[(&str, &str)]) -> KeychainClientState {
+        let mut state = KeychainClientState::new_with_host(
+            "dsid".to_string(),
+            "adsid".to_string(),
+            "https://escrow.invalid".to_string(),
+        );
+        for (zone, class) in keys {
+            state.keystore.store_key(CloudKey {
+                uuid: format!("{zone}/{class}"),
+                zone_name: zone.to_string(),
+                keyclass: class.to_string(),
+                key: EncryptedCloudKey(vec![]),
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn a_zone_whose_tlk_share_was_skipped_is_an_error_not_a_panic() {
+        // One account's Manatee TLK share failed its signature check, so Manatee had no class
+        // key. Saving the Find My service key into it hit expect("Insert class key not found")
+        // and took the whole export task down. Other zones' keys must not stand in for it.
+        let state = state_holding(&[("FindMy", "classC"), ("Manatee", "classA")]);
+        let missing = state.get_class_key("Manatee", "classC");
+        assert!(matches!(missing, Err(PushError::ZoneKeyMissing(ref zone)) if zone == "Manatee"));
+    }
+
+    #[test]
+    fn a_zone_holding_its_class_key_can_be_saved_into() {
+        let state = state_holding(&[("Manatee", "classA"), ("Manatee", "classC")]);
+        assert_eq!(
+            state.get_class_key("Manatee", "classC").unwrap().uuid,
+            "Manatee/classC"
+        );
     }
 }
