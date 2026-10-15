@@ -1089,6 +1089,21 @@ pub struct KeychainClientState {
     pub items: HashMap<String, SavedKeychainZone>,
 }
 
+fn escrow_anisette_headers(mut headers: HashMap<String, String>, service_info: String) -> HashMap<String, String> {
+    let identity = &headers["X-Mme-Client-Info"];
+    if identity.contains("<Android;") { return headers; }
+    // A native generator's model/OS must survive FakeIOSConfig. Only the
+    // application component changes from akd to the escrow service (sbd).
+    let service_info = if identity.contains("<macOS;") || identity.contains("<Mac OS X;") {
+        match (identity.rsplit_once("> <"), service_info.rsplit_once("> <")) {
+            (Some((platform, _)), Some((_, application))) => format!("{platform}> <{application}"),
+            _ => identity.clone(),
+        }
+    } else { service_info };
+    headers.insert("X-Mme-Client-Info".to_string(), service_info);
+    headers
+}
+
 impl KeychainClientState {
     pub fn new(dsid: String, adsid: String, delegate: &MobileMeDelegateResponse) -> Option<KeychainClientState> {
         Some(KeychainClientState {
@@ -2298,9 +2313,9 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());        
         drop(state_lock);
 
-        let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
-
-        base_headers.insert("X-Mme-Client-Info".to_string(), self.config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.sbd/638.100.48)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS")));
+        let base_headers = self.anisette.lock().await.get_headers().await?.clone();
+        let service_info = self.config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.sbd/638.100.48)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS"));
+        let base_headers = escrow_anisette_headers(base_headers, service_info);
 
         map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 
@@ -2312,15 +2327,24 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let email = self.token_provider.get_gsa_email().await.expect("no email!");
 
         let state = self.state.read().await;
+        let headers = self.get_escrow_headers().await?;
+        let identity = headers["X-Mme-Client-Info"].to_str().unwrap();
+        let profile = if identity.contains("<Android;") { "android" }
+            else if identity.contains("<macOS;") || identity.contains("<Mac OS X;") { "macos" }
+            else if identity.contains("<iPhone OS;") { "ios" } else { "apple" };
         let resp = REQWEST.post(format!("{}/escrowproxy/api/{}", state.host, request.command.get_url()))
-            .headers(self.get_escrow_headers().await?)
+            .headers(headers)
             .header("Content-Type", "application/x-apple-plst")
             .basic_auth(&email, Some(&auth))
             .body(plist_to_string(&request)?)
             .send().await?; 
 
         if !resp.status().is_success() {
-            return Err(PushError::EscrowError(plist::from_bytes(&resp.bytes().await?)?))
+            warn!("stage=escrow_request command={} http={} host={} profile={} token_source=gsa_pet",
+                request.command.get_url(), resp.status().as_u16(), resp.url().host_str().unwrap_or("unknown"), profile);
+            let error: Value = plist::from_bytes(&resp.bytes().await?)?;
+            warn!("stage=escrow_response ec={:?}", error.as_dictionary().and_then(|body| body.get("errorCode")).and_then(Value::as_signed_integer));
+            return Err(PushError::EscrowError(error))
         }
 
         Ok(plist::from_bytes(&resp.bytes().await?)?)
@@ -2725,5 +2749,40 @@ mod tlkshare_signing_tests {
             ("n", 0xffff_ffff_ffff_fffeu64.to_le_bytes().to_vec()),
         ].map(|(k, v)| (k.to_string(), v)));
         assert_eq!(item.authenticated_data_v2("item-uuid", &fields), expected);
+    }
+}
+
+#[cfg(test)]
+mod escrow_identity_tests {
+    use super::escrow_anisette_headers;
+    use std::collections::HashMap;
+
+    #[test]
+    fn escrow_keeps_android_identity_with_android_generated_anisette() {
+        let android = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+        let headers = HashMap::from([
+            ("X-Mme-Client-Info".into(), android.into()),
+            ("X-Apple-I-MD".into(), "test-otp".into()),
+        ]);
+        let result = escrow_anisette_headers(headers, "<iPhone15,2> <iPhone OS;17.4;21E219> <com.apple.sbd/638.100.48>".into());
+        assert_eq!(result["X-Mme-Client-Info"], android);
+        assert_eq!(result["X-Apple-I-MD"], "test-otp");
+    }
+
+    #[test]
+    fn escrow_retains_service_profile_for_apple_anisette() {
+        let headers = HashMap::from([("X-Mme-Client-Info".into(), "<iPhone15,2> <iPhone OS;17.4;21E219> <com.apple.akd/1.0>".into())]);
+        let service = "<iPhone15,2> <iPhone OS;17.4;21E219> <com.apple.sbd/638.100.48>";
+        let result = escrow_anisette_headers(headers, service.into());
+        assert_eq!(result["X-Mme-Client-Info"], service);
+    }
+
+    #[test]
+    fn escrow_keeps_native_mac_platform_when_service_config_is_iphone() {
+        let native = "<Mac17,4> <macOS;26.5;25F71> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+        let headers = HashMap::from([("X-Mme-Client-Info".into(), native.into())]);
+        let service = "<iPhone15,2> <iPhone OS;17.4;21E219> <com.apple.AuthKit/1 (com.apple.sbd/638.100.48)>";
+        let result = escrow_anisette_headers(headers, service.into());
+        assert_eq!(result["X-Mme-Client-Info"], "<Mac17,4> <macOS;26.5;25F71> <com.apple.AuthKit/1 (com.apple.sbd/638.100.48)>");
     }
 }
