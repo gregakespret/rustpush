@@ -1203,12 +1203,13 @@ enum EscrowMetadataError {
     SchemaMismatch { error: plist::Error, shape: String },
 }
 
-/// These strings are a cross-repo interface, not just operator prose. export-findmy
-/// raises this module to `info` behind a redaction guard and then prints only the
-/// records it recognises by prefix (`SAFE_PREFIXES` in its `src/logging.rs`), so a
-/// reworded variant goes silently missing from the logs there rather than merely
-/// reading differently. `the_messages_keep_the_prefixes_export_findmy_filters_on`
-/// below pins them.
+/// The schema-mismatch prefix is a cross-repo interface, not just operator prose.
+/// export-findmy raises this module to `info` behind a redaction guard and prints
+/// its sub-`warn` records only when they start with a prefix on its allowlist
+/// (`SAFE_PREFIXES` in its `src/logging.rs`). These are `warn!`s, so today they pass
+/// unfiltered; the mismatch prefix is on that list so the line survives if its level
+/// ever drops, and a reworded one would then go silently missing rather than read
+/// differently. `the_messages_keep_the_prefixes_export_findmy_filters_on` pins it.
 impl std::fmt::Display for EscrowMetadataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1270,6 +1271,15 @@ fn decode_escrow_metadata(blob: &str) -> Result<EscrowMetadata, EscrowMetadataEr
         error,
         shape: metadata_shape(&value),
     })
+}
+
+/// The `info!` that opens `get_viable_bottles`. A function only so a test can pin its
+/// prefix: export-findmy's redaction guard drops every `info!` from this module that
+/// is not on its allowlist, and this line is on it — reword it and it vanishes there.
+fn escrow_lookup_summary(metadata_records: usize, viable_bottles: usize) -> String {
+    format!(
+        "Escrow lookup returned {metadata_records} metadata record(s) and {viable_bottles} viable Cuttlefish bottle(s)"
+    )
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -1844,11 +1854,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             metrics: Some(vec![])
         }).await?;
 
-        info!(
-            "Escrow lookup returned {} metadata record(s) and {} viable Cuttlefish bottle(s)",
-            metadata_list.len(),
-            response.valid.len()
-        );
+        info!("{}", escrow_lookup_summary(metadata_list.len(), response.valid.len()));
 
         let mut bottles = Vec::new();
         let mut missing_metadata = 0;
@@ -2772,10 +2778,10 @@ mod tlkshare_signing_tests {
 mod escrow_metadata_tests {
     use super::*;
 
-    /// A metadata blob shaped exactly as `get_viable_bottles` receives it: an XML
-    /// plist, base64 in the standard alphabet.
+    /// A metadata blob shaped as `enroll` writes one: a binary plist, base64 in the
+    /// standard alphabet.
     fn blob(dict: Dictionary) -> String {
-        base64_encode(plist_to_string(&Value::Dictionary(dict)).unwrap().as_bytes())
+        base64_encode(&plist_to_bin(&Value::Dictionary(dict)).unwrap())
     }
 
     /// Every key `EscrowMetadata` asks for, with the types Apple sends.
@@ -2877,8 +2883,9 @@ mod escrow_metadata_tests {
         };
         assert!(shape.contains("passcodeGeneration:string"), "{shape}");
         assert!(shape.contains("escrowedSPKI:data"), "{shape}");
-        // Key names and value types only. The shape is printed at `warn` and ends
-        // up in pasted bug reports, so no value from the record may ride along.
+        // Key names and value types only: the shape adds no record values to the
+        // line. The line as a whole is not value-free yet. serde's error ahead of
+        // the shape quotes the mismatched value (`invalid type: string "7"`).
         assert!(!shape.contains("C02ABCDEFGH"), "{shape}");
         assert!(!shape.contains("A1B2C3D4"), "{shape}");
     }
@@ -2886,24 +2893,21 @@ mod escrow_metadata_tests {
     #[test]
     fn the_messages_keep_the_prefixes_export_findmy_filters_on() {
         // export-findmy prints this module's sub-`warn` records only when it
-        // recognises them by prefix (`SAFE_PREFIXES` in its `src/logging.rs`).
-        // Reword a message there and the diagnostic does not change wording in the
-        // export logs — it disappears from them.
+        // recognises them by prefix (`SAFE_PREFIXES` in its `src/logging.rs`), and
+        // these two are that whole list. The lookup summary is an `info!`, filtered
+        // today; the mismatch is a `warn!`, listed for the day its level drops.
+        // Reword either and the diagnostic does not change wording in the export
+        // logs — it disappears from them.
         let mut mismatched = well_formed();
         mismatched.insert("passcodeGeneration".into(), Value::String("7".into()));
         let cases = [
-            (blob(mismatched), "Escrow metadata schema mismatch: "),
+            (escrow_lookup_summary(2, 1), "Escrow lookup returned "),
             (
-                base64_encode(b"bplist00"),
-                "Discarding escrow metadata that is not a valid plist: ",
-            ),
-            (
-                "a-b_cd==".to_string(),
-                "Discarding escrow metadata that is not valid base64: ",
+                decode_escrow_metadata(&blob(mismatched)).unwrap_err().to_string(),
+                "Escrow metadata schema mismatch: ",
             ),
         ];
-        for (blob, prefix) in cases {
-            let message = decode_escrow_metadata(&blob).unwrap_err().to_string();
+        for (message, prefix) in cases {
             assert!(message.starts_with(prefix), "{message:?} vs {prefix:?}");
         }
     }
