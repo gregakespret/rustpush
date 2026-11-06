@@ -350,7 +350,7 @@ async fn main() {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
-            Some(input.trim().to_string())
+            Some(icloud_auth::TfaAnswer::Code(input.trim().to_string()))
         };
         
         let mut account = AppleAccount::new_with_anisette(config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).unwrap();
@@ -437,7 +437,7 @@ async fn main() {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
-            Some(input.trim().to_string())
+            Some(icloud_auth::TfaAnswer::Code(input.trim().to_string()))
         };
 
     let acc = AppleAccount::login(appleid_closure, tfa_closure, 
