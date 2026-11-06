@@ -346,11 +346,11 @@ async fn main() {
         state.users.clone()
     } else {
         // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = |_sent_to: Option<&str>| {
+        let tfa_closure = |_prompt: icloud_auth::TfaPrompt| {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
-            input.trim().to_string()
+            Some(input.trim().to_string())
         };
         
         let mut account = AppleAccount::new_with_anisette(config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).unwrap();
@@ -433,11 +433,11 @@ async fn main() {
     let conf = (gsa.user.clone(), gsa.pass.as_ref().to_vec());
     let appleid_closure = move || conf.clone();
         // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = |_sent_to: Option<&str>| {
+        let tfa_closure = |_prompt: icloud_auth::TfaPrompt| {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
-            input.trim().to_string()
+            Some(input.trim().to_string())
         };
 
     let acc = AppleAccount::login(appleid_closure, tfa_closure, 
