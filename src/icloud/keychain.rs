@@ -281,6 +281,62 @@ impl CuttlefishTlkShare {
         }
         data
     }
+
+    /// A share's record as data_for_signing saw it, for a share that failed its signature check:
+    /// in record order, each field's name, CloudKit type, the value slots it arrived in with their
+    /// lengths, and what was signed for it. Never a value: those are the wrapped TLK, the peer ids
+    /// and the signature.
+    fn field_layout(fields: &[Field]) -> String {
+        fn name_of(field: &Field) -> Option<&str> {
+            field.identifier.as_ref().and_then(|i| i.name.as_deref())
+        }
+        let mut extras = 0;
+        let entries: Vec<String> = fields.iter().enumerate().map(|(i, field)| {
+            let Some(name) = name_of(field) else { return "?".to_string() };
+            let kind = match field.value.as_ref().and_then(|v| v.r#type) {
+                None => "untyped".to_string(),
+                Some(t) => cloudkit_proto::record::field::value::Type::try_from(t)
+                    .map_or_else(|_| format!("type{t}"), |t| t.as_str_name().to_string()),
+            };
+            let mut entry = format!("{name}:{kind}:{}", field.value.as_ref().map_or("no-value".to_string(), ck_value_slots));
+            if field.value.as_ref().and_then(|v| v.is_encrypted) == Some(true) {
+                entry.push_str(":encrypted");
+            }
+            // from_record and the extras map both keep the last field of a name, so an earlier one
+            // is never signed.
+            let superseded = fields[i + 1..].iter().any(|later| name_of(later) == Some(name));
+            if name.starts_with("server_") {
+                entry.push_str(":server");
+            } else if !Self::KNOWN_KEYS.contains(&name) {
+                extras += 1;
+                match field.value.as_ref().and_then(ckks_extra_field_bytes) {
+                    _ if superseded => entry.push_str(":extra-superseded"),
+                    Some(bytes) => entry.push_str(&format!(":extra-signed/{}", bytes.len())),
+                    None => entry.push_str(":extra-unsigned"),
+                }
+            } else if superseded {
+                entry.push_str(":superseded");
+            }
+            entry
+        }).collect();
+        format!("fields={} extras={extras} layout=[{}]", fields.len(), entries.join(", "))
+    }
+}
+
+/// The value slots a CloudKit field arrived in, with byte lengths (an item count for a list). For logs.
+fn ck_value_slots(value: &cloudkit_proto::record::field::Value) -> String {
+    let mut slots = vec![];
+    if let Some(b) = &value.bytes_value { slots.push(format!("bytes/{}", b.len())) }
+    if let Some(s) = &value.string_value { slots.push(format!("string/{}", s.len())) }
+    if value.signed_value.is_some() { slots.push("int64".to_string()) }
+    if value.double_value.is_some() { slots.push("double".to_string()) }
+    if value.date_value.is_some() { slots.push("date".to_string()) }
+    if value.location_value.is_some() { slots.push("location".to_string()) }
+    if value.reference_value.is_some() { slots.push("reference".to_string()) }
+    if value.asset_value.is_some() { slots.push("asset".to_string()) }
+    if value.package_value.is_some() { slots.push("package".to_string()) }
+    if !value.list_values.is_empty() { slots.push(format!("list/{}", value.list_values.len())) }
+    if slots.is_empty() { "empty".to_string() } else { slots.join("+") }
 }
 
 /// How CKKS serializes a record field it doesn't know, both in -[CKKSTLKShare dataForSigning:] and in
@@ -1989,9 +2045,9 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             // Like CKKS, leave a share we can't verify untrusted and carry on: one bad share
             // shouldn't throw away the TLKs for every other zone.
             if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
-                // Names only: the values are key material. The names show which field a mismatch came from.
-                let names: Vec<_> = record_fields.iter().filter_map(|f| f.identifier.as_ref()?.name.as_deref()).collect();
-                warn!("Skipping TLK share for {}: it failed its signature check ({e}); record fields {:?}", share.service(), names);
+                // Types and lengths only: the values are key material. The layout shows which field
+                // a mismatch can come from, and which copy of a repeated field was signed.
+                warn!("Skipping TLK share for {}: it failed its signature check ({e}); {}", share.service(), CuttlefishTlkShare::field_layout(record_fields));
                 first_failure.get_or_insert(e);
                 continue;
             }
@@ -2553,7 +2609,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 #[cfg(test)]
 mod tlkshare_signing_tests {
     use super::*;
-    use cloudkit_proto::record::field::{Identifier as FieldIdentifier, Value as CkValue};
+    use cloudkit_proto::record::field::{Identifier as FieldIdentifier, Value as CkValue, value::Type as CkType};
 
     // The expected payloads below are built by hand from -[CKKSTLKShare dataForSigning:]
     // (apple-oss-distributions/Security, keychain/ckks/CKKSTLKShare.m), not from our code.
@@ -2749,6 +2805,95 @@ mod tlkshare_signing_tests {
             ("n", 0xffff_ffff_ffff_fffeu64.to_le_bytes().to_vec()),
         ].map(|(k, v)| (k.to_string(), v)));
         assert_eq!(item.authenticated_data_v2("item-uuid", &fields), expected);
+    }
+
+    fn typed(kind: CkType, value: CkValue) -> CkValue {
+        CkValue { r#type: Some(kind as i32), ..value }
+    }
+
+    fn layout_names(layout: &str) -> Vec<&str> {
+        let list = layout.split_once("layout=[").unwrap().1.strip_suffix(']').unwrap();
+        list.split(", ").map(|entry| entry.split(':').next().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_failed_shares_layout_lists_a_repeated_field_at_each_occurrence() {
+        // The records that fail in production carry every known field twice, and from_record keeps
+        // only the last copy. A log that collapsed the repeat would hide that lead.
+        let mut fields = share_record(vec![field("tlkOwnershipProof", bytes(&[7; 97]))]);
+        fields.extend(share_record(vec![]));
+        let layout = CuttlefishTlkShare::field_layout(&fields);
+
+        assert!(layout.starts_with("fields=21 extras=1 layout=["), "{layout}");
+        let record_order: Vec<_> = fields.iter().map(|f| f.identifier.as_ref().unwrap().name.as_deref().unwrap()).collect();
+        assert_eq!(layout_names(&layout), record_order);
+        assert_eq!(layout_names(&layout).iter().filter(|n| **n == "receiver").count(), 2);
+        assert!(layout.contains("tlkOwnershipProof:untyped:bytes/97:extra-signed/97"), "{layout}");
+        // Only the second copy's values are signed; the log must say so for each first copy.
+        assert_eq!(layout.matches(":superseded").count(), 10, "{layout}");
+        assert!(layout.contains("receiver:untyped:string/13:superseded, "), "{layout}");
+        assert!(layout.ends_with("parentkeyref:untyped:reference]"), "{layout}");
+    }
+
+    #[test]
+    fn a_failed_shares_layout_carries_no_field_values() {
+        // A share holds the wrapped TLK, both peer ids and a signature. Names, types and lengths
+        // may reach the log; no value may, in any encoding.
+        let fields = vec![
+            field("version", int(918273645)),
+            field("receiver", string("RECEIVER-PEER-ID")),
+            field("sender", string("SENDER-PEER-ID")),
+            field("wrappedkey", string(&base64_encode(b"WRAPPED-TLK-BYTES"))),
+            field("signature", string(&base64_encode(b"SIGNATURE-BYTES"))),
+            field("tlkOwnershipProof", typed(CkType::BytesType, bytes(b"OWNERSHIP-PROOF"))),
+            field("created", date(123456789.0)),
+            field("n", double(271828.0)),
+        ];
+        let layout = CuttlefishTlkShare::field_layout(&fields);
+
+        for value in fields.iter().map(|f| f.value.as_ref().unwrap()) {
+            let mut renderings = vec![];
+            if let Some(s) = &value.string_value {
+                renderings.push(s.clone());
+                renderings.extend(crate::util::base64_decode_checked(s).ok().map(|b| String::from_utf8_lossy(&b).into_owned()));
+            }
+            for b in value.bytes_value.iter().chain(ckks_extra_field_bytes(value).as_ref()) {
+                renderings.extend([String::from_utf8_lossy(b).into_owned(), encode_hex(b), base64_encode(b)]);
+            }
+            renderings.extend(value.signed_value.map(|i| i.to_string()));
+            renderings.extend(value.double_value.map(|d| d.to_string()));
+            renderings.extend(value.date_value.as_ref().and_then(|d| d.time).map(|t| t.to_string()));
+            for rendering in renderings.iter().filter(|r| r.len() >= 4) {
+                assert!(!layout.contains(rendering.as_str()), "{rendering:?} leaked into {layout}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_shares_layout_shows_how_each_field_was_treated() {
+        // What to compare against Apple's encoding: each extra's CloudKit type, the slot its value
+        // arrived in, and how many bytes we signed for it. A kind CKKS skips is unsigned, a
+        // server_ field is never signed, and a known field is signed positionally.
+        let fields = vec![
+            field("proof", typed(CkType::BytesType, bytes(&[0; 97]))),
+            field("created", typed(CkType::DateType, date(0.0))),
+            field("aReference", typed(CkType::ReferenceType, reference())),
+            field("sealed", CkValue { is_encrypted: Some(true), ..typed(CkType::EncryptedBytesType, bytes(&[0; 3])) }),
+            field("both", CkValue { string_value: Some("s".into()), ..bytes(&[0; 2]) }),
+            field("server_modified", string("S")),
+            field("receiver", typed(CkType::StringType, string("peer"))),
+        ];
+        assert_eq!(
+            CuttlefishTlkShare::field_layout(&fields),
+            "fields=7 extras=5 layout=[\
+             proof:BYTES_TYPE:bytes/97:extra-signed/97, \
+             created:DATE_TYPE:date:extra-signed/20, \
+             aReference:REFERENCE_TYPE:reference:extra-unsigned, \
+             sealed:ENCRYPTED_BYTES_TYPE:bytes/3:encrypted:extra-signed/3, \
+             both:untyped:bytes/2+string/1:extra-signed/1, \
+             server_modified:untyped:string/1:server, \
+             receiver:STRING_TYPE:string/4]"
+        );
     }
 }
 
